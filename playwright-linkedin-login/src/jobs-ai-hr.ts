@@ -18,6 +18,7 @@ export type ApiJob = {
 };
 
 const DEFAULT_TIMEOUT = 60_000;
+const HARD_RUN_TIMEOUT_MS = 120_000;
 const MAX_RESULTS_TO_PROCESS = 80;
 const MAX_SCROLL_ROUNDS = 25;
 
@@ -118,16 +119,37 @@ async function scrollLeft(page: Page, scroller: ElementHandle<HTMLElement> | nul
   await page.waitForTimeout(650);
 }
 
-async function waitForAnyJobLinks(page: Page) {
+async function waitForJobsOrDetectBlock(page: Page): Promise<"OK" | "BLOCKED"> {
   const start = Date.now();
   while (Date.now() - start < DEFAULT_TIMEOUT) {
     await handleConsentIfPresent(page);
 
+    const blocked = await page
+      .locator(
+        [
+          'text="Sicherheitsüberprüfung"',
+          'text="Security Verification"',
+          'text="Verify"',
+          'text="Überprüfen"',
+          'text="Sign in to continue"',
+          'text="Melde dich an"',
+          'text="Join LinkedIn"',
+          'input[name="session_key"]',
+        ].join(",")
+      )
+      .first()
+      .isVisible()
+      .catch(() => false);
+
+    if (blocked) return "BLOCKED";
+
     const count = await page.locator('a[href*="/jobs/view/"]').count().catch(() => 0);
-    if (count > 0) return;
+    if (count > 0) return "OK";
 
     await page.waitForTimeout(400);
   }
+
+  return "BLOCKED";
 }
 
 async function collectLeftHrefs(page: Page, scroller: ElementHandle<HTMLElement> | null) {
@@ -219,76 +241,102 @@ function matchesAIandHR(text: string) {
   return { ai, hr, ok: ai && hr };
 }
 
+async function withHardTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(new Error(`TIMEOUT: Job fetch exceeded ${ms}ms`));
+    }, ms);
+
+    p.then((v) => {
+      clearTimeout(t);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+  });
+}
+
 /**
  * Main function used by the API route
  */
 export async function fetchLinkedInJobsAiHr(page: Page): Promise<ApiJob[]> {
   page.setDefaultTimeout(DEFAULT_TIMEOUT);
 
-  await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" });
-  await handleConsentIfPresent(page);
+  return withHardTimeout(
+    (async () => {
+      await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" });
+      await handleConsentIfPresent(page);
 
-  await waitForAnyJobLinks(page);
+      const state = await waitForJobsOrDetectBlock(page);
+      if (state === "BLOCKED") {
+        throw new Error(
+          "BLOCKED_OR_NO_JOBS: LinkedIn did not render job links (possible verification/anti-bot). Try HEADLESS=false and ensure no verification page is shown."
+        );
+      }
 
-  const scroller = await findLeftListScroller(page);
+      const scroller = await findLeftListScroller(page);
 
-  const seen = new Set<string>();
-  const jobs: ApiJob[] = [];
+      const seen = new Set<string>();
+      const jobs: ApiJob[] = [];
 
-  let stagnant = 0;
-  let lastSeen = 0;
+      let stagnant = 0;
+      let lastSeen = 0;
 
-  for (let round = 0; round < MAX_SCROLL_ROUNDS; round++) {
-    await handleConsentIfPresent(page);
+      for (let round = 0; round < MAX_SCROLL_ROUNDS; round++) {
+        await handleConsentIfPresent(page);
 
-    const hrefsRaw = await collectLeftHrefs(page, scroller);
-    const hrefs = hrefsRaw
-      .map((h) => h?.trim())
-      .filter(Boolean)
-      .map((h) => normalizeJobUrl(h!))
-      .filter(Boolean) as string[];
+        const hrefsRaw = await collectLeftHrefs(page, scroller);
+        const hrefs = hrefsRaw
+          .map((h) => h?.trim())
+          .filter(Boolean)
+          .map((h) => normalizeJobUrl(h!))
+          .filter(Boolean) as string[];
 
-    for (const jobUrl of hrefs) {
-      if (jobs.length >= MAX_RESULTS_TO_PROCESS) break;
-      if (seen.has(jobUrl)) continue;
+        for (const jobUrl of hrefs) {
+          if (jobs.length >= MAX_RESULTS_TO_PROCESS) break;
+          if (seen.has(jobUrl)) continue;
 
-      seen.add(jobUrl);
+          seen.add(jobUrl);
 
-      // Navigate directly to job page (stable vs. clicking virtualized list)
-      await page.goto(jobUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
-      await page.waitForTimeout(800);
+          // Navigate directly to job page (stable vs. clicking virtualized list)
+          await page.goto(jobUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+          await page.waitForTimeout(800);
 
-      const details = await readJobPageDetails(page);
+          const details = await readJobPageDetails(page);
 
-      const haystack = `${details.jobTitle}\n${details.company}\n${details.description}`;
-      const m = matchesAIandHR(haystack);
+          const haystack = `${details.jobTitle}\n${details.company}\n${details.description}`;
+          const m = matchesAIandHR(haystack);
 
-      if (!m.ok) continue;
+          if (!m.ok) continue;
 
-      jobs.push({
-        jobTitle: details.jobTitle,
-        description: details.description,
-        link: jobUrl,
-        contact: "", // best-effort: LinkedIn usually doesn't provide a stable contact name
-        company: details.company,
-        postingDate: details.postingDate, // may be ""
-      });
-    }
+          jobs.push({
+            jobTitle: details.jobTitle,
+            description: details.description,
+            link: jobUrl,
+            contact: "", // best-effort: LinkedIn usually doesn't provide a stable contact name
+            company: details.company,
+            postingDate: details.postingDate, // may be ""
+          });
+        }
 
-    if (jobs.length >= MAX_RESULTS_TO_PROCESS) break;
+        if (jobs.length >= MAX_RESULTS_TO_PROCESS) break;
 
-    // stagnation detection
-    if (seen.size === lastSeen) stagnant++;
-    else stagnant = 0;
-    lastSeen = seen.size;
+        // stagnation detection
+        if (seen.size === lastSeen) stagnant++;
+        else stagnant = 0;
+        lastSeen = seen.size;
 
-    if (stagnant >= 4) break;
+        if (stagnant >= 4) break;
 
-    // back to results and scroll
-    await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
-    await page.waitForTimeout(800);
-    await scrollLeft(page, scroller, 1800);
-  }
+        // back to results and scroll
+        await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+        await page.waitForTimeout(800);
+        await scrollLeft(page, scroller, 1800);
+      }
 
-  return jobs;
+      return jobs;
+    })(),
+    HARD_RUN_TIMEOUT_MS
+  );
 }
