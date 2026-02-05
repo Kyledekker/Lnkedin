@@ -14,7 +14,7 @@ export type ApiJob = {
 };
 
 const DEFAULT_TIMEOUT = 60_000;
-const HARD_RUN_TIMEOUT_MS = 120_000; // <- nach 2 Minuten wird abgebrochen (kein Hängen mehr)
+const HARD_RUN_TIMEOUT_MS = 120_000;
 const MAX_RESULTS_TO_PROCESS = 40;
 const MAX_SCROLL_ROUNDS = 10;
 
@@ -22,11 +22,17 @@ const SEARCH_URL =
   'https://www.linkedin.com/jobs/search-results/?keywords=%22AI%22%20%2B%20%22HR%22&origin=SWITCH_SEARCH_VERTICAL';
 
 const OUT_DIR = "debug";
+
 const AI_REGEX =
   /\b(ai|artificial intelligence|ki|k\.?i\.?|machine learning|ml\b|genai|generative ai|llm|large language model)\b/i;
 
 const HR_REGEX =
   /\b(hr|human resources|people\b|talent\b|recruit(ing|er|ment)|people operations|personal(wesen|abteilung)?)\b/i;
+
+// WICHTIG: kurze Selector-Timeouts auf Job-Seiten (damit es nicht "hängt")
+const JOB_SELECTOR_TIMEOUT = 2_500;
+const NAV_TIMEOUT_JOB_MS = 15_000;
+const NAV_TIMEOUT_SEARCH_MS = 15_000;
 
 function normalizeText(s: string | null | undefined) {
   return (s ?? "").replace(/\s+/g, " ").trim();
@@ -74,9 +80,9 @@ async function handleConsentIfPresent(page: Page) {
 
   for (const sel of candidates) {
     const btn = page.locator(sel).first();
-    if (await btn.isVisible().catch(() => false)) {
+    if (await btn.isVisible({ timeout: 800 }).catch(() => false)) {
       await btn.click({ timeout: 2_000 }).catch(() => {});
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(350);
       return;
     }
   }
@@ -111,9 +117,11 @@ async function findLeftListScroller(page: Page): Promise<ElementHandle<HTMLEleme
 
 async function scrollLeft(page: Page, scroller: ElementHandle<HTMLElement> | null, deltaPx: number) {
   if (scroller) {
-    await scroller.evaluate((el, delta) => {
-      el.scrollTop = el.scrollTop + delta;
-    }, deltaPx).catch(() => {});
+    await scroller
+      .evaluate((el, delta) => {
+        el.scrollTop = el.scrollTop + delta;
+      }, deltaPx)
+      .catch(() => {});
   } else {
     await page.evaluate((delta) => window.scrollBy(0, delta), deltaPx).catch(() => {});
   }
@@ -125,7 +133,6 @@ async function waitForJobsOrDetectBlock(page: Page): Promise<"OK" | "BLOCKED"> {
   while (Date.now() - start < 30_000) {
     await handleConsentIfPresent(page);
 
-    // Soft-block indicators
     const blocked = await page
       .locator(
         [
@@ -140,7 +147,7 @@ async function waitForJobsOrDetectBlock(page: Page): Promise<"OK" | "BLOCKED"> {
         ].join(",")
       )
       .first()
-      .isVisible()
+      .isVisible({ timeout: 800 })
       .catch(() => false);
 
     if (blocked) return "BLOCKED";
@@ -169,6 +176,20 @@ async function collectLeftHrefs(page: Page, scroller: ElementHandle<HTMLElement>
     .catch(() => []);
 }
 
+// Per-URL Navigation mit eigenem Timeout + Debug
+async function gotoWithTimeout(page: Page, url: string, ms: number, tag: string) {
+  await Promise.race([
+    page.goto(url, { waitUntil: "domcontentloaded" }),
+    page.waitForTimeout(ms).then(() => {
+      throw new Error(`NAV_TIMEOUT_${tag}: ${ms}ms (${url})`);
+    }),
+  ]).catch(async (e) => {
+    await dumpDebug(page, `nav-timeout-${tag}`);
+    throw e;
+  });
+}
+
+// ✅ Robust: niemals 60s auf fehlende Elemente warten
 async function readJobPageDetails(page: Page) {
   const titleLoc = page.locator("h1").first();
   const companyLoc = page
@@ -181,10 +202,11 @@ async function readJobPageDetails(page: Page) {
     )
     .first();
 
+  // "Show more" nur klicken, wenn er schnell sichtbar ist
   const showMore = page.locator('button:has-text("Mehr anzeigen"), button:has-text("Show more")').first();
-  if (await showMore.isVisible().catch(() => false)) {
-    await showMore.click({ timeout: 2_000 }).catch(() => {});
-    await page.waitForTimeout(250);
+  if (await showMore.isVisible({ timeout: 800 }).catch(() => false)) {
+    await showMore.click({ timeout: 1_500 }).catch(() => {});
+    await page.waitForTimeout(200);
   }
 
   const descLoc = page
@@ -197,9 +219,24 @@ async function readJobPageDetails(page: Page) {
     )
     .first();
 
-  const jobTitle = normalizeText(await titleLoc.textContent().catch(() => "")) || "(unknown title)";
-  const company = normalizeText(await companyLoc.textContent().catch(() => "")) || "(unknown company)";
-  const description = normalizeText(await descLoc.textContent().catch(() => ""));
+  const jobTitle =
+    normalizeText(await titleLoc.textContent({ timeout: JOB_SELECTOR_TIMEOUT }).catch(() => "")) || "(unknown title)";
+  const company =
+    normalizeText(await companyLoc.textContent({ timeout: JOB_SELECTOR_TIMEOUT }).catch(() => "")) ||
+    "(unknown company)";
+
+  // description: wenn Selector nix liefert, fallback auf body-innerText (gekürzt)
+  let description = normalizeText(await descLoc.textContent({ timeout: JOB_SELECTOR_TIMEOUT }).catch(() => ""));
+  if (!description) {
+    description = normalizeText(
+      await page
+        .evaluate(() => {
+          const t = document.body?.innerText || "";
+          return t.slice(0, 15_000);
+        })
+        .catch(() => "")
+    );
+  }
 
   return { jobTitle, company, description };
 }
@@ -233,23 +270,32 @@ export async function fetchLinkedInJobsAiHr(page: Page): Promise<ApiJob[]> {
   return withHardTimeout(
     (async () => {
       console.log(`🌍 Opening jobs search: ${SEARCH_URL}`);
-      await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" });
+      await gotoWithTimeout(page, SEARCH_URL, NAV_TIMEOUT_SEARCH_MS, "search");
       await handleConsentIfPresent(page);
 
-      const state = await waitForJobsOrDetectBlock(page);
-      if (state === "BLOCKED") {
+      const state0 = await waitForJobsOrDetectBlock(page);
+      if (state0 === "BLOCKED") {
         await dumpDebug(page, "blocked-or-nojobs");
         throw new Error(
           "BLOCKED_OR_NO_JOBS: LinkedIn did not render job links (possible verification/anti-bot). Try HEADLESS=false and ensure no verification page is shown."
         );
       }
 
-      const scroller = await findLeftListScroller(page);
-
       const seen = new Set<string>();
       const jobs: ApiJob[] = [];
 
       for (let round = 0; round < MAX_SCROLL_ROUNDS; round++) {
+        await handleConsentIfPresent(page);
+
+        const state = await waitForJobsOrDetectBlock(page);
+        if (state === "BLOCKED") {
+          await dumpDebug(page, "blocked-midrun");
+          throw new Error("BLOCKED_MIDRUN: LinkedIn blocked/verification detected during scrolling.");
+        }
+
+        // ✅ Scroller IMMER neu holen (nie über goto hinweg behalten)
+        const scroller = await findLeftListScroller(page);
+
         const hrefsRaw = await collectLeftHrefs(page, scroller);
         const hrefs = hrefsRaw
           .map((h) => h?.trim())
@@ -266,31 +312,39 @@ export async function fetchLinkedInJobsAiHr(page: Page): Promise<ApiJob[]> {
           seen.add(jobUrl);
           console.log(`➡️ Open job: ${jobUrl}`);
 
-          await page.goto(jobUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
-          await page.waitForTimeout(800);
+          try {
+            await gotoWithTimeout(page, jobUrl, NAV_TIMEOUT_JOB_MS, "job");
+            await page.waitForTimeout(500);
 
-          const details = await readJobPageDetails(page);
-          const haystack = `${details.jobTitle}\n${details.company}\n${details.description}`;
-          const m = matchesAIandHR(haystack);
+            const details = await readJobPageDetails(page);
+            const haystack = `${details.jobTitle}\n${details.company}\n${details.description}`;
+            const m = matchesAIandHR(haystack);
 
-          if (!m.ok) continue;
-
-          jobs.push({
-            jobTitle: details.jobTitle,
-            description: details.description,
-            link: jobUrl,
-            contact: "",
-            company: details.company,
-            postingDate: "",
-          });
+            if (m.ok) {
+              jobs.push({
+                jobTitle: details.jobTitle,
+                description: details.description,
+                link: jobUrl,
+                contact: "",
+                company: details.company,
+                postingDate: "",
+              });
+            }
+          } catch (e) {
+            console.warn(`⚠️ Job failed/timeout: ${jobUrl}`);
+          } finally {
+            // ✅ Egal was passiert: zurück zur Ergebnisliste, sonst bleibst du auf /jobs/view hängen
+            await gotoWithTimeout(page, SEARCH_URL, NAV_TIMEOUT_SEARCH_MS, "search-back").catch(() => {});
+            await page.waitForTimeout(400);
+            await handleConsentIfPresent(page);
+          }
         }
 
         if (jobs.length >= MAX_RESULTS_TO_PROCESS) break;
 
-        // back to results and scroll further
-        await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
-        await page.waitForTimeout(800);
-        await scrollLeft(page, scroller, 1800);
+        // Weiter scrollen (Scroller neu holen!)
+        const scrollerAfter = await findLeftListScroller(page);
+        await scrollLeft(page, scrollerAfter, 1800);
       }
 
       console.log(`✅ Done. Jobs matched (AI+HR): ${jobs.length}`);
