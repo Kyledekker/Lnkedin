@@ -1,10 +1,13 @@
-
 {
   "name": "playwright-linkedin-login",
   "version": "1.0.0",
-  "description": "Playwright boilerplate for LinkedIn login + session persistence + job search export + REST API",
-  "main": "index.js",
+  "description": "Playwright LinkedIn automation with Azure Functions wrappers",
+  "main": "dist/src/functions/*.js",
   "scripts": {
+    "build": "tsc -p .",
+    "clean": "rm -rf dist",
+    "prestart": "npm run build",
+    "start": "func start",
     "install:browsers": "playwright install",
     "login": "ts-node login.ts",
     "reuse": "ts-node reuse-session.ts",
@@ -12,6 +15,7 @@
     "api": "ts-node server.ts"
   },
   "dependencies": {
+    "@azure/functions": "^4.5.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "playwright": "^1.48.2"
