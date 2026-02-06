@@ -1,0 +1,7 @@
+.git*
+.vscode
+local.settings.json
+node_modules
+src/**/*.test.ts
+playwright-report
+*.log
